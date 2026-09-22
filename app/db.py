@@ -17,8 +17,23 @@ CREATE TABLE IF NOT EXISTS devices (
     window_size_seconds      INTEGER NOT NULL DEFAULT 60,
     allowed_lateness_seconds INTEGER NOT NULL DEFAULT 30,
     watermark                REAL,          -- 已见最大 event_time（epoch 秒），持久化水位线
+    label_version            INTEGER NOT NULL DEFAULT 0,  -- 标签集版本：每次成功 PUT +1
+    labels_updated_at        TEXT,          -- 最近一次标签写入时间（从未写入为 NULL）
     created_at               TEXT NOT NULL
 );
+
+-- 设备当前标签（仅保存最新版本的键值；旧版本随版本号被覆盖替换，不保留历史）
+CREATE TABLE IF NOT EXISTS device_labels (
+    device_id   TEXT NOT NULL,
+    label_key   TEXT NOT NULL,               -- 规范化后的键名（去首尾空白、小写）
+    label_value TEXT NOT NULL,               -- 去首尾空白后的值
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (device_id, label_key),      -- 规范化后重复键在同事务替换，不会落两行
+    FOREIGN KEY (device_id) REFERENCES devices (device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_labels_key_value
+    ON device_labels (label_key, label_value);
 
 CREATE TABLE IF NOT EXISTS events (
     device_id   TEXT NOT NULL,
@@ -163,6 +178,21 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库就地迁移（幂等）：为 devices 表补标签版本列。
+
+    CREATE TABLE IF NOT EXISTS 不会给已存在的旧表加列，这里按 PRAGMA 检测结果补。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(devices)").fetchall()}
+    if "label_version" not in cols:
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN label_version INTEGER NOT NULL DEFAULT 0"
+        )
+    if "labels_updated_at" not in cols:
+        conn.execute("ALTER TABLE devices ADD COLUMN labels_updated_at TEXT")
 
 
 @contextmanager
@@ -172,5 +202,27 @@ def session() -> Iterator[sqlite3.Connection]:
     try:
         with conn:
             yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def immediate_session() -> Iterator[sqlite3.Connection]:
+    """立即加写锁的事务会话：进入即 BEGIN IMMEDIATE，正常退出提交，异常回滚。
+
+    用于"读当前版本 → 校验 → 写入"的乐观并发场景：写锁保证同一时刻只有一个
+    写事务，读到的版本在事务内不会被其他写者改变。与 Python 3.12 之前的
+    sqlite3 隐式 BEGIN 行为兼容（这里显式 BEGIN，不依赖 autocommit 语义）。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
     finally:
         conn.close()

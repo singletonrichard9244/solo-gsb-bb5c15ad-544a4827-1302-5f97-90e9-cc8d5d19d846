@@ -8,6 +8,17 @@
 - 窗口封存后到达的事件标记为 late，仍计入聚合，同时生成一条修正记录，
   窗口的 correction_count 随之递增。
 
+设备可版本化标签：
+- PUT /devices/{device_id}/labels 以**全量替换**语义写入不超过 20 个 key/value；
+  键名在同一 SQLite 写事务内规范化（去首尾空白、小写、^[a-z0-9][a-z0-9_.-]*$），
+  值只去首尾空白；规范化后重复键或非法键名返回 400 且不改动数据。
+- 每次成功写入都把 devices.label_version 加一（单调递增，从 1 起），旧标签同事务删除。
+- GET /devices/{device_id}/labels 返回当前标签与版本（从未写入时版本 0、标签为空）。
+- GET /devices?label_key=&label_value= 按**当前**标签筛选设备（只给 label_value
+  不给 label_key 返回 422）。
+- PUT 请求带 if_version 时做乐观并发校验：必须等于服务端当前版本，
+  不匹配返回 409 且不写入任何数据（写锁事务保证读版本与写入的一致性）。
+
 设备组同步窗口汇总：
 - 设备组为固定成员组，创建时所有成员设备必须存在且窗口配置一致
   （window_size_seconds / allowed_lateness_seconds），聚合方式为 sum 或 avg。
@@ -32,6 +43,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -45,6 +57,11 @@ from . import db
 DEFAULT_WINDOW_SIZE_SECONDS = 60
 DEFAULT_ALLOWED_LATENESS_SECONDS = 30
 MAX_GROUP_MEMBERS = 500
+MAX_DEVICE_LABELS = 20
+MAX_LABEL_KEY_LENGTH = 63
+MAX_LABEL_VALUE_LENGTH = 256
+# 规范化后的合法键名：小写字母/数字开头，其余允许下划线、点、连字符
+LABEL_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
 
 @asynccontextmanager
@@ -54,7 +71,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.3.0", lifespan=lifespan)
 
 
 # ---------- Pydantic 模型 ----------
@@ -99,6 +116,24 @@ class DeviceOut(BaseModel):
     open_windows: int
     sealed_windows: int
     created_at: datetime
+
+
+class LabelItem(BaseModel):
+    key: str = Field(min_length=1, max_length=256)
+    value: str = Field(min_length=0, max_length=256)
+
+
+class LabelUpdateRequest(BaseModel):
+    labels: list[LabelItem] = Field(min_length=0, max_length=MAX_DEVICE_LABELS)
+    # 乐观并发：客户端基于上次读到的版本提交；缺省表示不校验
+    if_version: Optional[int] = Field(default=None, ge=0)
+
+
+class LabelsOut(BaseModel):
+    device_id: str
+    version: int
+    labels: dict[str, str]
+    updated_at: Optional[datetime] = None
 
 
 class WindowOut(BaseModel):
@@ -253,25 +288,86 @@ def require_device(conn: sqlite3.Connection, device_id: str) -> sqlite3.Row:
     return row
 
 
-def device_out(conn: sqlite3.Connection, device_id: str) -> DeviceOut:
-    dev = require_device(conn, device_id)
-    stats = conn.execute(
-        "SELECT"
-        " (SELECT COUNT(*) FROM events WHERE device_id = ?) AS event_count,"
-        " (SELECT COUNT(*) FROM windows WHERE device_id = ? AND status = 'open') AS open_windows,"
-        " (SELECT COUNT(*) FROM windows WHERE device_id = ? AND status = 'sealed') AS sealed_windows",
-        (device_id, device_id, device_id),
-    ).fetchone()
+_DEVICE_STATS_SELECT = (
+    "SELECT d.*,"
+    " (SELECT COUNT(*) FROM events WHERE device_id = d.device_id) AS event_count,"
+    " (SELECT COUNT(*) FROM windows WHERE device_id = d.device_id AND status = 'open') AS open_windows,"
+    " (SELECT COUNT(*) FROM windows WHERE device_id = d.device_id AND status = 'sealed') AS sealed_windows"
+    " FROM devices d"
+)
+
+
+def device_row_to_out(r: sqlite3.Row) -> DeviceOut:
     return DeviceOut(
-        device_id=dev["device_id"],
-        window_size_seconds=dev["window_size_seconds"],
-        allowed_lateness_seconds=dev["allowed_lateness_seconds"],
-        watermark=to_iso(dev["watermark"]),
-        event_count=stats["event_count"],
-        open_windows=stats["open_windows"],
-        sealed_windows=stats["sealed_windows"],
-        created_at=dev["created_at"],
+        device_id=r["device_id"],
+        window_size_seconds=r["window_size_seconds"],
+        allowed_lateness_seconds=r["allowed_lateness_seconds"],
+        watermark=to_iso(r["watermark"]),
+        event_count=r["event_count"],
+        open_windows=r["open_windows"],
+        sealed_windows=r["sealed_windows"],
+        created_at=r["created_at"],
     )
+
+
+def device_out(conn: sqlite3.Connection, device_id: str) -> DeviceOut:
+    row = conn.execute(
+        _DEVICE_STATS_SELECT + " WHERE d.device_id = ?", (device_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"device not found: {device_id}")
+    return device_row_to_out(row)
+
+
+def normalize_label_key(raw: str) -> str:
+    """键名规范化：去首尾空白并转小写；非法键名抛 400。"""
+    key = raw.strip().lower()
+    if len(key) > MAX_LABEL_KEY_LENGTH or not LABEL_KEY_RE.fullmatch(key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid label key: {raw!r}; after normalization it must match "
+                f"{LABEL_KEY_RE.pattern} and be at most {MAX_LABEL_KEY_LENGTH} characters"
+            ),
+        )
+    return key
+
+
+def normalize_label_value(raw: str) -> str:
+    """值规范化：仅去首尾空白；空值或超长值抛 400。"""
+    value = raw.strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="label value must not be empty")
+    if len(value) > MAX_LABEL_VALUE_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"label value must be at most {MAX_LABEL_VALUE_LENGTH} characters",
+        )
+    return value
+
+
+def normalize_labels(items: list[LabelItem]) -> dict[str, str]:
+    """规范化整批标签并拒绝规范化后的重复键；结果按键名排序。"""
+    labels: dict[str, str] = {}
+    for item in items:
+        key = normalize_label_key(item.key)
+        value = normalize_label_value(item.value)
+        if key in labels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"duplicate label key after normalization: {key}",
+            )
+        labels[key] = value
+    return dict(sorted(labels.items()))
+
+
+def get_device_labels(conn: sqlite3.Connection, device_id: str) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT label_key, label_value FROM device_labels"
+        " WHERE device_id = ? ORDER BY label_key",
+        (device_id,),
+    ).fetchall()
+    return {r["label_key"]: r["label_value"] for r in rows}
 
 
 # ---------- 设备组工具 ----------
@@ -652,10 +748,109 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
         return device_out(conn, device_id)
 
 
+@app.get("/devices", response_model=list[DeviceOut])
+def list_devices(
+    label_key: Optional[str] = Query(default=None),
+    label_value: Optional[str] = Query(default=None),
+) -> list[DeviceOut]:
+    """列出全部设备；可按当前标签筛选。
+
+    - `label_key` + `label_value`：当前标签精确匹配该键值对的设备；
+    - 仅 `label_key`：当前标签中存在该键的设备；
+    - 仅 `label_value`：422（值必须依附键筛选）；
+    - 都不给：全部设备。
+    筛选键名与写入时同样规范化（去空白、小写）后再匹配。
+    """
+    if label_key is not None and label_key.strip() == "":
+        label_key = None
+    if label_value is not None and label_key is None:
+        raise HTTPException(
+            status_code=422, detail="label_value requires label_key to be set"
+        )
+
+    sql = _DEVICE_STATS_SELECT
+    params: list = []
+    if label_key is not None:
+        key = label_key.strip().lower()
+        if label_value is not None:
+            sql += (
+                " WHERE EXISTS (SELECT 1 FROM device_labels l"
+                " WHERE l.device_id = d.device_id AND l.label_key = ? AND l.label_value = ?)"
+            )
+            params.extend([key, label_value.strip()])
+        else:
+            sql += (
+                " WHERE EXISTS (SELECT 1 FROM device_labels l"
+                " WHERE l.device_id = d.device_id AND l.label_key = ?)"
+            )
+            params.append(key)
+    sql += " ORDER BY d.device_id"
+
+    with db.session() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        return [device_row_to_out(r) for r in rows]
+
+
 @app.get("/devices/{device_id}", response_model=DeviceOut)
 def get_device_info(device_id: str) -> DeviceOut:
     with db.session() as conn:
         return device_out(conn, device_id)
+
+
+# ---------- 设备标签接口 ----------
+
+@app.put("/devices/{device_id}/labels", response_model=LabelsOut)
+def put_device_labels(device_id: str, req: LabelUpdateRequest) -> LabelsOut:
+    """全量替换设备标签（不超过 20 个 key/value），版本单调递增。
+
+    在单个 SQLite 写事务内完成：规范化键名（去空白、小写）、拒绝重复键、
+    乐观并发校验（if_version 与当前版本不符返回 409 且不写入任何数据）、
+    删除旧标签、写入新标签并把版本加一。
+    """
+    labels = normalize_labels(req.labels)  # 规范化/校验失败时不进入事务、不改数据
+    now = utcnow_iso()
+
+    with db.immediate_session() as conn:
+        dev = require_device(conn, device_id)
+        current_version = dev["label_version"]
+
+        if req.if_version is not None and req.if_version != current_version:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"label version conflict: if_version={req.if_version} "
+                    f"does not match current version {current_version}"
+                ),
+            )
+
+        new_version = current_version + 1
+        conn.execute("DELETE FROM device_labels WHERE device_id = ?", (device_id,))
+        conn.executemany(
+            "INSERT INTO device_labels (device_id, label_key, label_value, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            [(device_id, key, value, now) for key, value in labels.items()],
+        )
+        conn.execute(
+            "UPDATE devices SET label_version = ?, labels_updated_at = ? WHERE device_id = ?",
+            (new_version, now, device_id),
+        )
+
+    return LabelsOut(
+        device_id=device_id, version=new_version, labels=labels, updated_at=now
+    )
+
+
+@app.get("/devices/{device_id}/labels", response_model=LabelsOut)
+def get_device_labels_endpoint(device_id: str) -> LabelsOut:
+    """返回设备当前标签与版本；从未写入标签时版本为 0、标签为空。"""
+    with db.session() as conn:
+        dev = require_device(conn, device_id)
+        return LabelsOut(
+            device_id=device_id,
+            version=dev["label_version"],
+            labels=get_device_labels(conn, device_id),
+            updated_at=dev["labels_updated_at"],
+        )
 
 
 @app.get("/devices/{device_id}/windows", response_model=list[WindowOut])
