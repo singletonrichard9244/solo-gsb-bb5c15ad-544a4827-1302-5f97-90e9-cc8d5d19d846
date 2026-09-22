@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）与**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）以及**设备可版本化标签**（全量替换、键名规范化、单调版本号、`if_version` 乐观并发、按当前标签筛选设备）。
 
 ## 核心语义
 
@@ -29,6 +29,15 @@
   - 修订列表按 revision 升序返回每个快照的 `value`、`kind`（`revision`/`baseline`）与成员数；
   - diff 按**成员顺序**返回每个**发生变化**成员的前后贡献（sum 聚合贡献为窗口 `sum`，avg 聚合贡献为窗口 `avg`）与 `count/sum/avg/correction_count` 的数值差，未变化成员不列出；
   - 版本参数非法（缺失、`<1`、`from >= to`）返回 `422`；组、窗口或任一修订不存在返回 `404`。
+
+### 设备可版本化标签
+
+- **全量替换**：`PUT /devices/{id}/labels` 用请求体中的标签集合**整体替换**设备当前标签（不是增量 merge）；传空数组即清空标签。每次成功写入 `version` 单调加一，从 `1` 起。
+- **数量与长度限制**：每次最多 **20** 个 key/value（超出返回 `422`）；键 1–128 字符、值 1–512 字符。
+- **键名规范化**：键名先去除首尾空白再保存（值原样保存）；规范化后为空键、或出现重复键（含 `" x"` 与 `"x "` 这种规范化后撞名的情况）返回 `400`，且**不改动任何数据、版本不升**。
+- **乐观并发**：请求带 `if_version` 时，其值必须等于设备当前版本才写入，否则返回 `409` 且事务回滚、数据不变；`if_version=0` 用于设备**首次**设置标签。校验与替换在单个 `BEGIN IMMEDIATE` 写事务内完成，并发请求不会双双覆盖。
+- **读取**：`GET /devices/{id}/labels` 返回当前标签与版本；设备存在但从未设置过标签时返回 `version=0`、空对象，设备不存在返回 `404`。
+- **按标签筛选**：`GET /devices?label_key=...` 返回含该键的设备；再加 `&label_value=...` 按键值对精确匹配；只传 `label_value` 不传 `label_key` 返回 `400`。筛选始终针对**当前**标签，已被替换掉的历史键值不会命中。
 
 ## 启动
 
@@ -354,6 +363,58 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 - `from_revision` / `to_revision` 均必填且 `>= 1`，且 `from_revision < to_revision`，否则返回 `422`。
 - 组、窗口不存在，或指定的任一 revision 无快照（例如 baseline 之前被伪造的旧版本号）返回 `404`。
 
+### 12. 设备可版本化标签
+
+设置标签（全量替换，最多 20 个；键名自动去首尾空白，重复键 / 纯空白键返回 `400`）：
+
+```bash
+curl -X PUT http://localhost:8000/devices/sensor-001/labels \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "labels": [
+      {"key": "site", "value": "shanghai"},
+      {"key": "floor", "value": "3"}
+    ]
+  }'
+```
+
+```json
+{
+  "device_id": "sensor-001",
+  "version": 1,
+  "labels": {"site": "shanghai", "floor": "3"},
+  "updated_at": "2026-09-22T10:05:00Z"
+}
+```
+
+带 `if_version` 做乐观并发更新（必须等于当前版本，否则 `409` 且不改数据；首次设置用 `if_version: 0`）：
+
+```bash
+curl -X PUT http://localhost:8000/devices/sensor-001/labels \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "if_version": 1,
+    "labels": [
+      {"key": "site", "value": "beijing"},
+      {"key": "floor", "value": "3"}
+    ]
+  }'
+# 版本落后/超前 → 409 {"detail": "label version conflict: expected 1, current version is 2"}
+```
+
+读取当前标签与版本（从未设置过标签的设备返回 `"version": 0`、`"labels": {}`）：
+
+```bash
+curl http://localhost:8000/devices/sensor-001/labels
+```
+
+按当前标签筛选设备（键存在 / 键值对精确匹配）：
+
+```bash
+curl 'http://localhost:8000/devices?label_key=site'
+curl 'http://localhost:8000/devices?label_key=site&label_value=beijing'
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -361,7 +422,10 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/ingest` | 按设备提交事件批次（幂等） |
 | `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置 |
+| `GET` | `/devices` | 设备列表，支持按当前标签筛选 `?label_key=&label_value=`（只给 value 返回 400） |
 | `GET` | `/devices/{device_id}` | 设备水位线与统计 |
+| `PUT` | `/devices/{device_id}/labels` | 全量替换设备标签（≤20 个，键名规范化、重复键 400）；带 `if_version` 做乐观并发，冲突 409 不改数据 |
+| `GET` | `/devices/{device_id}/labels` | 当前标签与版本（从未设置返回 version=0） |
 | `GET` | `/devices/{device_id}/windows` | 各时间窗聚合值、状态、修正次数（支持 `?status=open\|sealed`） |
 | `GET` | `/devices/{device_id}/corrections` | 迟到数据修正记录 |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
@@ -382,6 +446,7 @@ tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
   test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
+  test_labels.py    # 设备标签测试（规范化、重复键、版本递增、if_version 409、按标签筛选）
 Dockerfile
 docker-compose.yml
 requirements.txt

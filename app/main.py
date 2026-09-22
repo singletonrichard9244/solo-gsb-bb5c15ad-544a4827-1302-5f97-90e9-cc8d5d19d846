@@ -27,6 +27,17 @@
   绝不伪造更早的历史版本。
 - 提供修订列表与两版本 diff 接口；diff 按成员顺序给出前后贡献与数值差，仅列发生变化的成员，
   非法版本返回 422、不存在的组/窗口/修订返回 404。
+
+设备可版本化标签：
+- PUT /devices/{device_id}/labels 接收不超过 20 个 key/value，在单个 SQLite 写事务内
+  全量替换设备的当前标签；键名先做规范化（去首尾空白），规范化后为空或重复均拒绝（400）。
+- 每次成功写入 version 单调加一（从 1 起）；GET 返回当前标签集合与版本，从未设置过的设备
+  返回 version=0、空标签，设备不存在返回 404。
+- 请求带 if_version 时做乐观并发校验：必须与当前 version 完全一致才写入，否则返回 409 且
+  事务回滚、数据不变（if_version=0 用于首次设置）。写事务以 BEGIN IMMEDIATE 开启，
+  杜绝两个并发请求读到同一旧版本后双双覆盖。
+- GET /devices 可按当前标签筛选：label_key 单独给出时匹配含该键的设备，
+  label_key + label_value 同时给出时按键值对精确匹配。
 """
 
 from __future__ import annotations
@@ -45,6 +56,9 @@ from . import db
 DEFAULT_WINDOW_SIZE_SECONDS = 60
 DEFAULT_ALLOWED_LATENESS_SECONDS = 30
 MAX_GROUP_MEMBERS = 500
+MAX_DEVICE_LABELS = 20
+MAX_LABEL_KEY_LENGTH = 128
+MAX_LABEL_VALUE_LENGTH = 512
 
 
 @asynccontextmanager
@@ -54,7 +68,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.3.0", lifespan=lifespan)
 
 
 # ---------- Pydantic 模型 ----------
@@ -99,6 +113,23 @@ class DeviceOut(BaseModel):
     open_windows: int
     sealed_windows: int
     created_at: datetime
+
+
+class LabelIn(BaseModel):
+    key: str = Field(min_length=1, max_length=MAX_LABEL_KEY_LENGTH)
+    value: str = Field(min_length=1, max_length=MAX_LABEL_VALUE_LENGTH)
+
+
+class LabelsPutRequest(BaseModel):
+    labels: list[LabelIn] = Field(min_length=0, max_length=MAX_DEVICE_LABELS)
+    if_version: Optional[int] = Field(default=None, ge=0)  # 乐观并发：必须等于当前 version
+
+
+class LabelsOut(BaseModel):
+    device_id: str
+    version: int
+    labels: dict[str, str]
+    updated_at: Optional[datetime] = None
 
 
 class WindowOut(BaseModel):
@@ -271,6 +302,50 @@ def device_out(conn: sqlite3.Connection, device_id: str) -> DeviceOut:
         open_windows=stats["open_windows"],
         sealed_windows=stats["sealed_windows"],
         created_at=dev["created_at"],
+    )
+
+
+# ---------- 设备标签工具 ----------
+
+def normalize_label_items(items: list[LabelIn]) -> list[tuple[str, str]]:
+    """规范化键名（去首尾空白）并拒绝空键 / 重复键。
+
+    值不做规范化，原样保存；返回按提交顺序排列的 (key, value) 列表。
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item.key.strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="label key must not be empty or blank")
+        if key in seen:
+            raise HTTPException(status_code=400, detail=f"duplicate label key after normalization: {key}")
+        seen.add(key)
+        pairs.append((key, item.value))
+    return pairs
+
+
+def label_version(conn: sqlite3.Connection, device_id: str) -> int:
+    """设备当前标签版本；从未设置过标签（无 meta 行）按 0 处理。"""
+    row = conn.execute(
+        "SELECT version FROM device_label_meta WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    return row["version"] if row is not None else 0
+
+
+def labels_out(conn: sqlite3.Connection, device_id: str, version: int) -> LabelsOut:
+    meta = conn.execute(
+        "SELECT updated_at FROM device_label_meta WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    rows = conn.execute(
+        "SELECT key, value FROM device_labels WHERE device_id = ? ORDER BY position",
+        (device_id,),
+    ).fetchall()
+    return LabelsOut(
+        device_id=device_id,
+        version=version,
+        labels={r["key"]: r["value"] for r in rows},
+        updated_at=meta["updated_at"] if meta is not None else None,
     )
 
 
@@ -656,6 +731,98 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
 def get_device_info(device_id: str) -> DeviceOut:
     with db.session() as conn:
         return device_out(conn, device_id)
+
+
+@app.get("/devices", response_model=list[DeviceOut])
+def list_devices(
+    label_key: Optional[str] = Query(default=None, min_length=1, max_length=MAX_LABEL_KEY_LENGTH),
+    label_value: Optional[str] = Query(default=None, min_length=1, max_length=MAX_LABEL_VALUE_LENGTH),
+) -> list[DeviceOut]:
+    """列出设备，可按当前标签筛选。
+
+    - 不带参数：返回全部设备；
+    - 仅 label_key：返回当前标签中含该键的设备（键按规范化后的精确名匹配）；
+    - label_key + label_value：按键值对精确匹配；
+    - 只给 label_value 不给 label_key 无意义，返回 400。
+    """
+    if label_value is not None and label_key is None:
+        raise HTTPException(status_code=400, detail="label_value requires label_key")
+
+    with db.session() as conn:
+        if label_key is None:
+            rows = conn.execute("SELECT device_id FROM devices ORDER BY device_id").fetchall()
+        elif label_value is None:
+            rows = conn.execute(
+                "SELECT device_id FROM device_labels WHERE key = ? ORDER BY device_id",
+                (label_key.strip(),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT device_id FROM device_labels WHERE key = ? AND value = ? ORDER BY device_id",
+                (label_key.strip(), label_value),
+            ).fetchall()
+        return [device_out(conn, r["device_id"]) for r in rows]
+
+
+@app.put("/devices/{device_id}/labels", response_model=LabelsOut)
+def put_device_labels(device_id: str, req: LabelsPutRequest) -> LabelsOut:
+    """全量替换设备的当前标签，并在同一事务内保存递增版本。
+
+    键名先规范化（去首尾空白），规范化后为空或重复返回 400；标签数上限 20 由模型校验（422）。
+    带 if_version 时做乐观并发校验：必须等于当前 version 才写入，否则 409 且不改数据
+    （if_version=0 表示设备尚未设置过标签，即首次创建）。
+    """
+    # 规范化/重复检查不触碰数据库，放在事务外，避免非法请求白拿写锁
+    pairs = normalize_label_items(req.labels)
+    now = utcnow_iso()
+
+    # BEGIN IMMEDIATE：读当前版本与写新快照在同一写事务内串行完成，
+    # 两个并发 PUT 不可能读到同一旧版本后双双提交。
+    with db.session(immediate=True) as conn:
+        require_device(conn, device_id)
+        current = label_version(conn, device_id)
+        if req.if_version is not None and req.if_version != current:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"label version conflict: expected {req.if_version},"
+                    f" current version is {current}"
+                ),
+            )
+
+        # 全量替换：旧标签整体删除后按提交顺序重插；version 单调加一。
+        # 与版本号更新在同一事务内，任一步失败整体回滚，外部永远看不到半成品。
+        conn.execute("DELETE FROM device_labels WHERE device_id = ?", (device_id,))
+        conn.executemany(
+            "INSERT INTO device_labels (device_id, key, value, position) VALUES (?, ?, ?, ?)",
+            [(device_id, key, value, i) for i, (key, value) in enumerate(pairs)],
+        )
+        if current == 0:
+            conn.execute(
+                "INSERT INTO device_label_meta (device_id, version, updated_at) VALUES (?, 1, ?)",
+                (device_id, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE device_label_meta SET version = version + 1, updated_at = ?"
+                " WHERE device_id = ?",
+                (now, device_id),
+            )
+        new_version = current + 1
+        return LabelsOut(
+            device_id=device_id,
+            version=new_version,
+            labels={key: value for key, value in pairs},
+            updated_at=now,
+        )
+
+
+@app.get("/devices/{device_id}/labels", response_model=LabelsOut)
+def get_device_labels(device_id: str) -> LabelsOut:
+    """返回设备当前标签与版本。设备存在但从未设置过标签时 version=0、labels 为空。"""
+    with db.session() as conn:
+        require_device(conn, device_id)
+        return labels_out(conn, device_id, label_version(conn, device_id))
 
 
 @app.get("/devices/{device_id}/windows", response_model=list[WindowOut])

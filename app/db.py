@@ -55,6 +55,25 @@ CREATE TABLE IF NOT EXISTS corrections (
     created_at   TEXT NOT NULL
 );
 
+-- 设备可版本化标签：每次 PUT 全量替换为当前快照，仅存当前版本。
+-- version 从 1 起单调递增；设备从未设置过标签时没有 meta 行，按 version=0 处理。
+CREATE TABLE IF NOT EXISTS device_label_meta (
+    device_id   TEXT PRIMARY KEY,
+    version     INTEGER NOT NULL,        -- 每次成功 PUT 递增 1
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS device_labels (
+    device_id   TEXT NOT NULL,
+    key         TEXT NOT NULL,           -- 已规范化（去首尾空白）的键名
+    value       TEXT NOT NULL,
+    position    INTEGER NOT NULL,        -- 保留提交顺序
+    PRIMARY KEY (device_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_labels_kv
+    ON device_labels (key, value);
+
 -- 设备组：固定成员，成员设备的窗口配置（大小/允许迟到）必须一致
 CREATE TABLE IF NOT EXISTS device_groups (
     group_id                 TEXT PRIMARY KEY,
@@ -166,11 +185,17 @@ def init_db() -> None:
 
 
 @contextmanager
-def session() -> Iterator[sqlite3.Connection]:
-    """事务会话：正常退出提交，异常回滚，始终关闭连接。"""
+def session(immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """事务会话：正常退出提交，异常回滚，始终关闭连接。
+
+    immediate=True 时以 BEGIN IMMEDIATE 开启写事务（立即获取 RESERVED 锁），
+    用于乐观并发校验等“先读后写”场景，避免两个并发事务读到同一旧版本后双双覆盖。
+    """
     conn = connect()
     try:
         with conn:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
     finally:
         conn.close()
